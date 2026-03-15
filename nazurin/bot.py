@@ -1,6 +1,7 @@
 import asyncio
 from time import time
 
+import aiofiles.os
 from aiogram import Bot, flags
 from aiogram.client.default import DefaultBotProperties
 from aiogram.client.session.aiohttp import AiohttpSession
@@ -10,7 +11,7 @@ from aiogram.types import FSInputFile, InputMediaPhoto, Message
 
 from nazurin import config
 from nazurin.database import Database
-from nazurin.models import File, Illust, Image, Ugoira
+from nazurin.models import File, Illust, Ugoira
 from nazurin.sites import SiteManager
 from nazurin.storage import Storage
 from nazurin.utils import logger
@@ -19,8 +20,12 @@ from nazurin.utils.exceptions import AlreadyExistsError, NazurinError
 from nazurin.utils.helpers import (
     handle_bad_request,
     remove_files_older_than,
+    resize_image_for_telegram,
     sanitize_caption,
 )
+
+TG_GROUP_NUMBER_LIMIT = 10
+TG_GROUP_SIZE_LIMIT = 50 * 1024 * 1024  # 50 MB
 
 
 class NazurinBot(Bot):
@@ -54,15 +59,13 @@ class NazurinBot(Bot):
     @flags.chat_action(ChatAction.UPLOAD_PHOTO)
     async def send_single_group(
         self,
-        imgs: list[Image],
+        imgs: list[InputMediaPhoto],
         caption: str,
         chat_id: int,
         reply_to: int | None = None,
     ):
-        # TODO: Fetch display URL in batch
-        media = [InputMediaPhoto(media=await img.display_url()) for img in imgs]
-        media[0].caption = caption
-        await self.send_media_group(chat_id, media, reply_to_message_id=reply_to)
+        imgs[0].caption = caption
+        await self.send_media_group(chat_id, imgs, reply_to_message_id=reply_to)
 
     async def send_photos(
         self,
@@ -76,9 +79,26 @@ class NazurinBot(Bot):
         if len(imgs) == 0:
             raise NazurinError("No image to send, try download option.")
 
-        while imgs:
-            groups.append(imgs[:10])
-            imgs = imgs[10:]
+        # Split a list of images into groups of max 50MB each
+        groups: list[list[InputMediaPhoto]] = []
+        current_group: list[InputMediaPhoto] = []
+        current_size = 0
+
+        for img in imgs:
+            resized_img = await resize_image_for_telegram(img.path)
+            img_size = await aiofiles.os.path.getsize(resized_img)
+            if (
+                len(current_group) >= TG_GROUP_NUMBER_LIMIT
+                or current_size + img_size > TG_GROUP_SIZE_LIMIT
+            ):
+                groups.append(current_group)
+                current_group = []
+                current_size = 0
+            current_group.append(InputMediaPhoto(media=FSInputFile(resized_img)))
+            current_size += img_size
+
+        if current_group:
+            groups.append(current_group)
 
         for group in groups:
             await self.send_single_group(group, caption, chat_id, reply_to)
@@ -96,6 +116,7 @@ class NazurinBot(Bot):
             reply_to = None
         try:
             if isinstance(illust, Ugoira):
+                # Note: Videos have a 50MB limit, but we only resize images for now
                 await self.send_animation(
                     chat_id,
                     FSInputFile(illust.video.path),  # TODO: Handle URL
@@ -103,6 +124,7 @@ class NazurinBot(Bot):
                     reply_to_message_id=reply_to,
                 )
             else:
+                await illust.download()
                 await self.send_photos(illust, chat_id, reply_to)
         except TelegramBadRequest as error:
             await handle_bad_request(message, error)
@@ -176,12 +198,9 @@ class NazurinBot(Bot):
             raise AlreadyExistsError
 
         # Send / Forward to gallery & Save to album
-        download = asyncio.create_task(illust.download())
+        await illust.download()
         if config.GALLERY_ID:
-            save = asyncio.create_task(self.send_to_gallery(urls, illust, message))
-            await asyncio.gather(save, download)
-        else:
-            await download
+            await self.send_to_gallery(urls, illust, message)
 
         await self.storage.store(illust)
         document.data["collected_at"] = time()

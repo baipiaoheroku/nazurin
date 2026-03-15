@@ -17,10 +17,13 @@ import aiojobs
 from aiogram.enums import MessageEntityType
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import Message
-from PIL import Image
+from humanize import naturalsize
+from PIL import Image as PILImage
+from PIL.Image import Resampling
 
 from nazurin.models import Caption
 from nazurin.utils.decorators import async_wrap
+from nazurin.utils.exceptions import NazurinError
 
 from . import logger
 
@@ -31,6 +34,12 @@ CAPTION_MAX_LENGTH = 1024
 WRONG_FILE_IDENTIFIER = "Wrong file identifier/HTTP URL specified"
 INVALID_HTTP_URL_CONTENT = "Failed to get HTTP URL content"
 GROUP_SEND_FAILED = "Group send failed"
+WEBPAGE_CURL_FAILED = "WEBPAGE_CURL_FAILED"
+
+# https://core.telegram.org/bots/api#sendphoto
+TG_PHOTO_WIDTH_HEIGHT_RATIO_LIMIT = 20
+TG_PHOTO_DIMENSION_LIMIT = 10000
+TG_PHOTO_FILE_SIZE_LIMIT = 10 * 1024 * 1024  # 10 MB
 
 
 async def handle_bad_request(message: Message, error: TelegramBadRequest):
@@ -40,6 +49,7 @@ async def handle_bad_request(message: Message, error: TelegramBadRequest):
     if (
         WRONG_FILE_IDENTIFIER in error.message
         or INVALID_HTTP_URL_CONTENT in error.message
+        or WEBPAGE_CURL_FAILED in error.message
     ):
         await message.reply(
             "Failed to send image as photo, maybe the size is too big, "
@@ -212,17 +222,125 @@ def check_image(path: str | os.PathLike) -> bool:
     """
 
     try:
-        with Image.open(path) as image:
+        with PILImage.open(path) as image:
             image.verify()
 
         # verify() does not detect all the possible image defects
         # e.g. truncated images, try to open the image to detect
-        with Image.open(path) as image:
+        with PILImage.open(path) as image:
             image.load()
         return True
     except OSError as error:
         logger.warning("Invalid image {}: {}", path, error)
         return False
+
+
+@async_wrap
+def resize_image_for_telegram(path: str | os.PathLike) -> Path:
+    """
+    Resize image if it exceeds Telegram Bot API limits:
+    - File size: max 10 MB
+    - Dimensions: width + height must not exceed 10,000
+
+    Returns the path to the resized image (or original if no resize needed).
+    """
+
+    path = Path(path)
+    file_size = path.stat().st_size
+
+    try:
+        with PILImage.open(path) as image:
+            width, height = image.size
+            dimension_sum = width + height
+
+            if height != 0 and width / height > TG_PHOTO_WIDTH_HEIGHT_RATIO_LIMIT:
+                raise NazurinError(
+                    f"Width and height ratio of image exceeds Telegram limit "
+                    f"({width} / {height} > {TG_PHOTO_WIDTH_HEIGHT_RATIO_LIMIT}, "
+                    "try download option.",
+                )
+
+            needs_resize = (
+                file_size > TG_PHOTO_FILE_SIZE_LIMIT
+                or dimension_sum > TG_PHOTO_DIMENSION_LIMIT
+            )
+            if not needs_resize:
+                return path
+
+            scale_factor = 1.0
+
+            if dimension_sum > TG_PHOTO_DIMENSION_LIMIT:
+                dimension_scale = (
+                    TG_PHOTO_DIMENSION_LIMIT / dimension_sum * 0.95
+                )  # 5% margin
+                scale_factor = min(scale_factor, dimension_scale)
+                logger.info(
+                    "Image {} exceeds dimension limit ({} + {} > {}), "
+                    "scaling down by {:.2f}x",
+                    path.name,
+                    width,
+                    height,
+                    TG_PHOTO_DIMENSION_LIMIT,
+                    dimension_scale,
+                )
+
+            if file_size > TG_PHOTO_FILE_SIZE_LIMIT:
+                # Estimate scale factor needed for file size
+                # PNG compression varies, but we can estimate based on area reduction
+                # For safety, use aggressive scaling for large files
+                file_scale = max(
+                    0.5, (TG_PHOTO_FILE_SIZE_LIMIT / file_size) ** 0.5 * 0.8
+                )  # Square root scaling with 80% safety margin
+                scale_factor = min(scale_factor, file_scale)
+                logger.info(
+                    "Image {} exceeds file size limit ({} > {}), "
+                    "scaling down by {:.2f}x",
+                    path.name,
+                    file_size,
+                    TG_PHOTO_FILE_SIZE_LIMIT,
+                    file_scale,
+                )
+
+            new_width = int(width * scale_factor)
+            new_height = int(height * scale_factor)
+
+            resized_image = image.copy()
+            resized_image = resized_image.resize(
+                (new_width, new_height), Resampling.LANCZOS
+            )
+
+            stem = path.stem
+            suffix = path.suffix
+            parent = path.parent
+            resized_path = parent / f"{stem}_resized{suffix}"
+
+            if suffix.lower() in [".jpg", ".jpeg"]:
+                resized_image.save(
+                    resized_path, format="JPEG", optimize=True, quality=85
+                )
+            elif suffix.lower() == ".png":
+                resized_image.save(resized_path, format="PNG", optimize=True)
+            else:
+                resized_image.save(resized_path, optimize=True)
+
+            new_file_size = resized_path.stat().st_size
+            logger.info(
+                "Resized image {} -> {} ({}x{} -> {}x{}, {} -> {})",
+                path.name,
+                resized_path.name,
+                width,
+                height,
+                new_width,
+                new_height,
+                naturalsize(file_size, binary=True),
+                naturalsize(new_file_size, binary=True),
+            )
+
+            return resized_path
+
+    except OSError as error:
+        logger.warning("Failed to resize image {}: {}", path, error)
+        return path
 
 
 async def run_in_pool(tasks: Iterable[Coroutine], pool_size: int):

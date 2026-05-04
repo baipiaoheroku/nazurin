@@ -31,7 +31,7 @@ class Illust:
     async def download(
         self,
         *,
-        request_class: NazurinRequestSession = Request,
+        request_class: type[NazurinRequestSession] = Request,
         **kwargs,
     ):
         async with request_class(**kwargs) as session:

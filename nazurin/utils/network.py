@@ -6,6 +6,7 @@ from contextlib import AbstractAsyncContextManager, asynccontextmanager
 import aiofiles
 import cloudscraper
 from aiohttp import ClientSession, ClientTimeout, TCPConnector
+from curl_cffi import BrowserTypeLiteral, ProxySpec
 from curl_cffi.requests import AsyncSession as CurlSession
 from curl_cffi.requests import Response as CurlResponse
 from requests import Session
@@ -87,27 +88,29 @@ class CurlRequest(CurlSession, NazurinRequestSession):
         timeout: int = TIMEOUT,
         **kwargs,
     ):
-        self.cookies = cookies
-        self.headers = headers
+        self._cookies = cookies
+        self._headers = headers
         self.timeout = timeout
-        self.proxies = {"https": PROXY, "http": PROXY} if PROXY else None
+        self._proxies: ProxySpec | None = (
+            {"https": PROXY, "http": PROXY} if PROXY else None
+        )
         super().__init__(**kwargs)
 
     @asynccontextmanager
     async def get(
         self,
         *args,
-        impersonate: str = "chrome110",
+        impersonate: BrowserTypeLiteral = "chrome146",
         **kwargs,
     ) -> AsyncGenerator[CurlResponse, None]:
         yield await super().request(
             "GET",
             *args,
-            cookies=self.cookies,
-            headers=self.headers,
+            cookies=self._cookies,
+            headers=self._headers,
             timeout=self.timeout,
             impersonate=impersonate,
-            proxies=self.proxies,
+            proxies=self._proxies,
             **kwargs,
         )
 
@@ -161,7 +164,7 @@ class CloudScraperRequest(NazurinRequestSession):
                     "Download failed with status code {}",
                     response.status_code,
                 )
-                logger.info("Response: {}", await response.text)
+                logger.info("Response: {}", response.text)
                 response.raise_for_status()
             async with aiofiles.open(destination, "wb") as f:
                 for chunk in response.iter_content(DOWNLOAD_CHUNK_SIZE):

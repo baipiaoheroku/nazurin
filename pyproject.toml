@@ -24,7 +24,7 @@ dependencies = [
     "curl-cffi~=0.15.0",
     "dnspython~=2.6.1",
     "environs~=14.1.0",
-    "firebase-admin~=6.6.0",
+    "firebase-admin~=7.4",
     "humanize~=4.11.0",
     "loguru~=0.7.3",
     "mega-py",
@@ -90,6 +90,9 @@ extend-select = [
     "YTT",    # flake8-2020
 ]
 ignore = ["PERF203", "COM812", "RET504"]
+
+[tool.uv]
+constraint-dependencies = ["grpcio>=1.71.0"]
 
 [tool.uv.sources]
 mega-py = { git = "https://github.com/y-young/mega.py", rev = "6015359" }
